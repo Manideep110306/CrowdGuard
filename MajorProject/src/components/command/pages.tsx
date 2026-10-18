@@ -1,4 +1,11 @@
-import { useEffect, useState, type FormEvent } from 'react';
+import {
+  useEffect,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type FormEvent,
+  type MouseEvent as ReactMouseEvent,
+} from 'react';
 import { Link, useNavigate } from '@tanstack/react-router';
 import { Plus, Pencil, Trash2, Play, Camera, Save, BrainCircuit, ArrowRight, Download, FileText, Shield, Eye, EyeOff, Radio, Database, LogOut } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -6,7 +13,14 @@ import { useCommand } from './store';
 import { PageHeading, Panel, Badge, ZoneCards, Modal, Stats } from './shared';
 import { Feed, CameraSelector, MonitoringControls } from './feed';
 import { AlertTable } from './alerts';
-import { monitoringApi, type BackendStatus, type Camera as CameraType, type CameraDraft } from '@/lib/monitoring-api';
+import {
+  monitoringApi,
+  type BackendStatus,
+  type Camera as CameraType,
+  type CameraDraft,
+  type CameraZoneConfig,
+  type ZonePoint,
+} from '@/lib/monitoring-api';
 import { useAuth } from '@/lib/auth';
 import { AuthError } from '@/lib/auth-api';
 
@@ -432,12 +446,1151 @@ export function CamerasPage() {
     </>
   );
 }
-const predefinedZones = [
-  ['Left Zone', 'Left third of the frame', '20'],
-  ['Center Zone', 'Center third of the frame', '20'],
-  ['Right Zone', 'Right third of the frame', '20'],
+// ============================================================
+// USER-DEFINED CAMERA ZONE EDITOR
+// ============================================================
+
+const emptyZoneForm = {
+  name: '',
+  capacity: '20',
+  warning: '80',
+  critical: '100',
+  enabled: true,
+};
+
+const zoneColors = [
+  '#31c48d',
+  '#60a5fa',
+  '#f59e0b',
+  '#c084fc',
+  '#fb7185',
+  '#22d3ee',
 ];
-export function ZonesPage(){return <><PageHeading title="Zone Configuration" subtitle="Predefined vertical zones used by the AI monitoring pipeline." eyebrow="SPATIAL INTELLIGENCE"/><p className="form-note">Cameras use these enabled vertical zones automatically when no custom zones are saved. The user-defined zone editor can be added next.</p><Panel title="Predefined vertical zones"><div className="table-scroll"><table><thead><tr><th>Zone</th><th>Frame coverage</th><th>Capacity</th><th>Warning threshold</th><th>Critical threshold</th><th>Enabled</th></tr></thead><tbody>{predefinedZones.map(([name,coverage,capacity])=><tr key={name}><td>{name}</td><td>{coverage}</td><td>{capacity}</td><td>80%</td><td>100%</td><td>Yes</td></tr>)}</tbody></table></div></Panel></>;}
+
+type PreviewKind = 'webcam' | 'image' | null;
+
+export function ZonesPage() {
+  const {
+    cameras,
+    selectedCamera,
+    setSelectedCamera,
+    notify,
+  } = useCommand();
+
+  const [cameraId, setCameraId] = useState(selectedCamera || '');
+
+  const [zones, setZones] = useState<CameraZoneConfig[]>([]);
+  const [loadingZones, setLoadingZones] = useState(false);
+  const [savingZones, setSavingZones] = useState(false);
+  const [zoneError, setZoneError] = useState('');
+
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [draftPoints, setDraftPoints] = useState<ZonePoint[]>([]);
+  const [form, setForm] = useState({ ...emptyZoneForm });
+
+  const [previewKind, setPreviewKind] = useState<PreviewKind>(null);
+  const [previewImageUrl, setPreviewImageUrl] = useState<string | null>(null);
+
+  const [previewSize, setPreviewSize] = useState({
+    width: 4,
+    height: 3,
+  });
+
+  const [previewError, setPreviewError] = useState('');
+
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const imageUrlRef = useRef<string | null>(null);
+
+  const selectedCameraInfo = cameras.find(
+    (camera) => camera.id === cameraId,
+  );
+
+  // ----------------------------------------------------------
+  // Keep the editor aligned with the selected camera
+  // ----------------------------------------------------------
+
+  useEffect(() => {
+    const selectedCameraExists = cameras.some(
+      (camera) => camera.id === selectedCamera,
+    );
+
+    if (
+      selectedCameraExists &&
+      selectedCamera !== cameraId
+    ) {
+      setCameraId(selectedCamera);
+      return;
+    }
+
+    const currentCameraExists = cameras.some(
+      (camera) => camera.id === cameraId,
+    );
+
+    if (!currentCameraExists) {
+      const firstCameraId = cameras[0]?.id ?? '';
+
+      if (firstCameraId !== cameraId) {
+        setCameraId(firstCameraId);
+
+        if (firstCameraId) {
+          setSelectedCamera(firstCameraId);
+        }
+      }
+    }
+  }, [
+    cameras,
+    cameraId,
+    selectedCamera,
+    setSelectedCamera,
+  ]);
+
+  // ----------------------------------------------------------
+  // Stop the browser camera preview
+  // ----------------------------------------------------------
+
+  const releaseWebcam = () => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(
+        (track) => track.stop(),
+      );
+
+      streamRef.current = null;
+    }
+  };
+
+  // ----------------------------------------------------------
+  // Load saved zones whenever the camera changes
+  // ----------------------------------------------------------
+
+  useEffect(() => {
+    let cancelled = false;
+
+    setZones([]);
+    setDraftPoints([]);
+    setEditingId(null);
+    setForm({ ...emptyZoneForm });
+    setZoneError('');
+    setPreviewError('');
+
+    releaseWebcam();
+
+    if (imageUrlRef.current) {
+      URL.revokeObjectURL(imageUrlRef.current);
+      imageUrlRef.current = null;
+    }
+
+    setPreviewImageUrl(null);
+    setPreviewKind(null);
+
+    if (!cameraId) {
+      setLoadingZones(false);
+
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    setLoadingZones(true);
+
+    monitoringApi
+      .zones(cameraId)
+      .then((savedZones) => {
+        if (!cancelled) {
+          setZones(savedZones);
+        }
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setZoneError(
+            error instanceof Error
+              ? error.message
+              : 'Unable to load camera zones.',
+          );
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setLoadingZones(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [cameraId]);
+
+  // ----------------------------------------------------------
+  // Connect the camera stream to the video preview
+  // ----------------------------------------------------------
+
+  useEffect(() => {
+    const video = videoRef.current;
+    const stream = streamRef.current;
+
+    if (
+      previewKind !== 'webcam' ||
+      !video ||
+      !stream
+    ) {
+      return;
+    }
+
+    video.srcObject = stream;
+
+    void video.play().catch(() => {
+      setPreviewError(
+        'The browser could not play the webcam preview.',
+      );
+    });
+  }, [previewKind]);
+
+  // ----------------------------------------------------------
+  // Cleanup on unmount
+  // ----------------------------------------------------------
+
+  useEffect(() => {
+    return () => {
+      streamRef.current?.getTracks().forEach(
+        (track) => track.stop(),
+      );
+
+      if (imageUrlRef.current) {
+        URL.revokeObjectURL(imageUrlRef.current);
+      }
+    };
+  }, []);
+
+  // ----------------------------------------------------------
+  // Start browser webcam preview
+  // ----------------------------------------------------------
+
+  const startWebcamPreview = async () => {
+    try {
+      setPreviewError('');
+
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error(
+          'Browser camera access is unavailable. Use localhost and enable camera permissions.',
+        );
+      }
+
+      releaseWebcam();
+
+      if (imageUrlRef.current) {
+        URL.revokeObjectURL(imageUrlRef.current);
+        imageUrlRef.current = null;
+      }
+
+      setPreviewImageUrl(null);
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+        },
+        audio: false,
+      });
+
+      streamRef.current = stream;
+
+      setPreviewSize({
+        width: 4,
+        height: 3,
+      });
+
+      setPreviewKind('webcam');
+    } catch (error) {
+      setPreviewError(
+        error instanceof Error
+          ? error.message
+          : 'Unable to open the webcam preview.',
+      );
+    }
+  };
+
+  // ----------------------------------------------------------
+  // Stop the browser preview
+  // ----------------------------------------------------------
+
+  const stopPreview = () => {
+    releaseWebcam();
+
+    setPreviewKind(null);
+    setPreviewError('');
+  };
+
+  // ----------------------------------------------------------
+  // Load a reference image for video or CCTV cameras
+  // ----------------------------------------------------------
+
+  const handleReferenceImage = (
+    event: ChangeEvent<HTMLInputElement>,
+  ) => {
+    const file = event.target.files?.[0];
+
+    if (!file) {
+      return;
+    }
+
+    if (!file.type.startsWith('image/')) {
+      setPreviewError(
+        'Please select an image file.',
+      );
+
+      event.target.value = '';
+      return;
+    }
+
+    releaseWebcam();
+
+    if (imageUrlRef.current) {
+      URL.revokeObjectURL(imageUrlRef.current);
+    }
+
+    const imageUrl = URL.createObjectURL(file);
+
+    imageUrlRef.current = imageUrl;
+
+    setPreviewError('');
+    setPreviewImageUrl(imageUrl);
+    setPreviewKind('image');
+
+    event.target.value = '';
+  };
+
+  // ----------------------------------------------------------
+  // Add a boundary point when the user clicks the preview
+  // ----------------------------------------------------------
+
+  const handleStageClick = (
+    event: ReactMouseEvent<HTMLDivElement>,
+  ) => {
+    if (!previewKind) {
+      return;
+    }
+
+    const rect = event.currentTarget.getBoundingClientRect();
+
+    if (rect.width <= 0 || rect.height <= 0) {
+      return;
+    }
+
+    const x = Math.min(
+      1,
+      Math.max(
+        0,
+        (event.clientX - rect.left) / rect.width,
+      ),
+    );
+
+    const y = Math.min(
+      1,
+      Math.max(
+        0,
+        (event.clientY - rect.top) / rect.height,
+      ),
+    );
+
+    setDraftPoints((previous) => [
+      ...previous,
+      {
+        x: Number(x.toFixed(6)),
+        y: Number(y.toFixed(6)),
+      },
+    ]);
+  };
+
+  // ----------------------------------------------------------
+  // Prepare a fresh zone
+  // ----------------------------------------------------------
+
+  const beginNewZone = () => {
+    setEditingId(null);
+    setDraftPoints([]);
+    setForm({ ...emptyZoneForm });
+    setZoneError('');
+  };
+
+  // ----------------------------------------------------------
+  // Load an existing zone for editing
+  // ----------------------------------------------------------
+
+  const editZone = (zone: CameraZoneConfig) => {
+    setEditingId(zone.id);
+
+    setDraftPoints(
+      zone.points.map((point) => ({
+        x: point.x,
+        y: point.y,
+      })),
+    );
+
+    setForm({
+      name: zone.name,
+      capacity: String(zone.capacity),
+      warning: String(zone.warning_threshold),
+      critical: String(zone.critical_threshold),
+      enabled: zone.enabled,
+    });
+
+    setZoneError('');
+  };
+
+  // ----------------------------------------------------------
+  // Add the drawn zone to the pending configuration
+  // ----------------------------------------------------------
+
+  const addZoneToList = (
+    event: FormEvent<HTMLFormElement>,
+  ) => {
+    event.preventDefault();
+
+    if (!cameraId) {
+      notify('Select a camera first.');
+      return;
+    }
+
+    if (draftPoints.length < 3) {
+      notify(
+        'Draw a polygon by clicking at least three points on the preview.',
+      );
+      return;
+    }
+
+    const name = form.name.trim();
+    const capacity = Number(form.capacity);
+    const warning = Number(form.warning);
+    const critical = Number(form.critical);
+
+    if (!name) {
+      notify('Enter a zone name.');
+      return;
+    }
+
+    if (
+      zones.some(
+        (zone) =>
+          zone.id !== editingId &&
+          zone.name.trim().toLowerCase() === name.toLowerCase(),
+      )
+    ) {
+      notify('A zone with this name already exists.');
+      return;
+    }
+
+    if (
+      !Number.isInteger(capacity) ||
+      capacity <= 0
+    ) {
+      notify('Capacity must be a positive whole number.');
+      return;
+    }
+
+    if (
+      !Number.isFinite(warning) ||
+      !Number.isFinite(critical) ||
+      warning < 0 ||
+      warning >= critical ||
+      critical > 100
+    ) {
+      notify(
+        'Set thresholds between 0 and 100, with warning below critical.',
+      );
+      return;
+    }
+
+    const zone: CameraZoneConfig = {
+      id:
+        editingId ??
+        `zone-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      name,
+      points: [...draftPoints],
+      capacity,
+      warning_threshold: warning,
+      critical_threshold: critical,
+      enabled: form.enabled,
+    };
+
+    setZones((previous) => {
+      if (editingId) {
+        return previous.map((item) =>
+          item.id === editingId ? zone : item,
+        );
+      }
+
+      return [...previous, zone];
+    });
+
+    setEditingId(null);
+    setDraftPoints([]);
+    setForm({ ...emptyZoneForm });
+
+    notify(
+      'Zone added to the pending configuration. Click Save All Zones to persist it.',
+    );
+  };
+
+  // ----------------------------------------------------------
+  // Delete a zone from the pending configuration
+  // ----------------------------------------------------------
+
+  const deleteZone = (zone: CameraZoneConfig) => {
+    const confirmed = window.confirm(
+      `Remove "${zone.name}" from this configuration? Remember to save your changes.`,
+    );
+
+    if (!confirmed) {
+      return;
+    }
+
+    setZones((previous) =>
+      previous.filter((item) => item.id !== zone.id),
+    );
+
+    if (editingId === zone.id) {
+      setEditingId(null);
+      setDraftPoints([]);
+      setForm({ ...emptyZoneForm });
+    }
+
+    notify(
+      'Zone removed from the pending configuration. Click Save All Zones to persist the change.',
+    );
+  };
+
+  // ----------------------------------------------------------
+  // Persist all zones to MongoDB through Flask
+  // ----------------------------------------------------------
+
+  const saveAllZones = async () => {
+    if (!cameraId || savingZones) {
+      return;
+    }
+
+    if (
+      selectedCameraInfo?.status === 'Online'
+    ) {
+      notify(
+        'Stop monitoring this camera before saving zone changes.',
+      );
+
+      return;
+    }
+
+    if (editingId) {
+      notify(
+        'Finish updating the selected zone before saving all zones.',
+      );
+
+      return;
+    }
+
+    setSavingZones(true);
+    setZoneError('');
+
+    try {
+      const savedZones = await monitoringApi.saveZones(
+        cameraId,
+        zones,
+      );
+
+      setZones(savedZones);
+
+      notify(
+        'Camera zone configuration saved successfully.',
+      );
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : 'Unable to save camera zones.';
+
+      setZoneError(message);
+      notify(message);
+    } finally {
+      setSavingZones(false);
+    }
+  };
+
+  const displayZones = zones.filter(
+    (zone) => zone.id !== editingId,
+  );
+
+  const selectedZone = zones.find(
+    (zone) => zone.id === editingId,
+  );
+
+  return (
+    <>
+      <PageHeading
+        title="Zone Configuration"
+        subtitle="Draw monitoring areas and configure individual crowd-safety thresholds."
+        eyebrow="SPATIAL INTELLIGENCE"
+      >
+        <Button
+          variant="outline"
+          onClick={beginNewZone}
+          disabled={!cameraId || savingZones}
+        >
+          <Plus />
+          New Zone
+        </Button>
+
+        <Button
+          onClick={() => void saveAllZones()}
+          disabled={
+            !cameraId ||
+            loadingZones ||
+            savingZones ||
+            selectedCameraInfo?.status === 'Online' ||
+            editingId !== null
+          }
+        >
+          <Save />
+          {savingZones ? 'Saving Zones…' : 'Save All Zones'}
+        </Button>
+      </PageHeading>
+
+      {cameras.length === 0 ? (
+        <Panel title="Camera required">
+          <div className="empty-state">
+            <Camera />
+            Register a webcam or CCTV camera before configuring monitoring zones.
+          </div>
+        </Panel>
+      ) : (
+        <>
+          <Panel title="Select camera">
+            <div className="form-stack">
+              <label>
+                Camera
+                <select
+                  value={cameraId}
+                  onChange={(event) => {
+                    const nextCameraId = event.target.value;
+
+                    setCameraId(nextCameraId);
+
+                    if (nextCameraId) {
+                      setSelectedCamera(nextCameraId);
+                    }
+                  }}
+                >
+                  {cameras.map((camera) => (
+                    <option
+                      key={camera.id}
+                      value={camera.id}
+                    >
+                      {camera.name} — {camera.location}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <p className="form-note">
+                Every camera has its own zone configuration. Stop monitoring
+                the selected camera before saving zone changes.
+              </p>
+            </div>
+          </Panel>
+
+          {zoneError && (
+            <div role="alert" className="form-note">
+              {zoneError}
+            </div>
+          )}
+
+          {selectedCameraInfo?.status === 'Online' && (
+            <div role="alert" className="form-note">
+              This camera is currently online. Stop monitoring it before
+              saving changes to its zones.
+            </div>
+          )}
+
+          <Panel title="Camera reference view">
+            <div className="form-stack">
+              <p className="form-note">
+                Click at least three points on the image to outline a polygon.
+                The last point connects back to the first when the zone is saved.
+              </p>
+
+              {selectedCameraInfo?.sourceType === 'Webcam' && (
+                <div className="modal-actions">
+                  <Button
+                    type="button"
+                    onClick={() => void startWebcamPreview()}
+                    disabled={previewKind === 'webcam'}
+                  >
+                    <Camera />
+                    Start Webcam Preview
+                  </Button>
+
+                  {previewKind === 'webcam' && (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={stopPreview}
+                    >
+                      Stop Preview
+                    </Button>
+                  )}
+                </div>
+              )}
+
+              <label>
+                Upload reference image
+                <input
+                  type="file"
+                  accept="image/*"
+                  onChange={handleReferenceImage}
+                />
+              </label>
+
+              <p className="form-note">
+                For video files and CCTV/RTSP sources, upload a representative
+                screenshot. For webcam configuration, you can use the browser
+                preview or an image from the same camera. Ensure the reference
+                view matches the actual camera angle.
+              </p>
+
+              {previewError && (
+                <div role="alert" className="form-note">
+                  {previewError}
+                </div>
+              )}
+
+              {previewKind ? (
+                <div
+                  className="zone-drawing-stage"
+                  onClick={handleStageClick}
+                  style={{
+                    position: 'relative',
+                    width: '100%',
+                    aspectRatio: `${previewSize.width} / ${previewSize.height}`,
+                    overflow: 'hidden',
+                    cursor: 'crosshair',
+                    background: '#111827',
+                    borderRadius: '10px',
+                    border: '1px solid #475569',
+                    touchAction: 'manipulation',
+                  }}
+                >
+                  {previewKind === 'webcam' && (
+                    <video
+                      ref={videoRef}
+                      autoPlay
+                      muted
+                      playsInline
+                      onLoadedMetadata={(event) => {
+                        const video = event.currentTarget;
+
+                        if (
+                          video.videoWidth > 0 &&
+                          video.videoHeight > 0
+                        ) {
+                          setPreviewSize({
+                            width: video.videoWidth,
+                            height: video.videoHeight,
+                          });
+                        }
+                      }}
+                      style={{
+                        position: 'absolute',
+                        inset: 0,
+                        width: '100%',
+                        height: '100%',
+                        objectFit: 'fill',
+                      }}
+                    />
+                  )}
+
+                  {previewKind === 'image' &&
+                    previewImageUrl && (
+                      <img
+                        src={previewImageUrl}
+                        alt="Camera reference for drawing monitoring zones"
+                        draggable={false}
+                        onLoad={(event) => {
+                          const image = event.currentTarget;
+
+                          setPreviewSize({
+                            width: image.naturalWidth,
+                            height: image.naturalHeight,
+                          });
+                        }}
+                        style={{
+                          position: 'absolute',
+                          inset: 0,
+                          width: '100%',
+                          height: '100%',
+                          objectFit: 'fill',
+                        }}
+                      />
+                    )}
+
+                  <svg
+                    viewBox="0 0 1000 1000"
+                    preserveAspectRatio="none"
+                    style={{
+                      position: 'absolute',
+                      inset: 0,
+                      width: '100%',
+                      height: '100%',
+                      pointerEvents: 'none',
+                    }}
+                  >
+                    {displayZones.map((zone) => {
+                      const index = zones.findIndex(
+                        (item) => item.id === zone.id,
+                      );
+
+                      const points = zone.points
+                        .map(
+                          (point) =>
+                            `${point.x * 1000},${point.y * 1000}`,
+                        )
+                        .join(' ');
+
+                      const color =
+                        zoneColors[index % zoneColors.length];
+
+                      const labelX =
+                        zone.points.reduce(
+                          (sum, point) => sum + point.x,
+                          0,
+                        ) /
+                        zone.points.length *
+                        1000;
+
+                      const labelY =
+                        zone.points.reduce(
+                          (sum, point) => sum + point.y,
+                          0,
+                        ) /
+                        zone.points.length *
+                        1000;
+
+                      return (
+                        <g key={zone.id}>
+                          <polygon
+                            points={points}
+                            fill={color}
+                            fillOpacity={0.16}
+                            stroke={color}
+                            strokeWidth={4}
+                            vectorEffect="non-scaling-stroke"
+                          />
+
+                          <text
+                            x={labelX}
+                            y={labelY}
+                            fill="white"
+                            stroke="#111827"
+                            strokeWidth={1.5}
+                            paintOrder="stroke"
+                            fontSize={24}
+                            textAnchor="middle"
+                          >
+                            {zone.name}
+                          </text>
+                        </g>
+                      );
+                    })}
+
+                    {draftPoints.length > 0 && (
+                      <g>
+                        {draftPoints.length >= 3 ? (
+                          <polygon
+                            points={draftPoints
+                              .map(
+                                (point) =>
+                                  `${point.x * 1000},${point.y * 1000}`,
+                              )
+                              .join(' ')}
+                            fill="#facc15"
+                            fillOpacity={0.18}
+                            stroke="#facc15"
+                            strokeWidth={4}
+                            strokeDasharray="10 6"
+                            vectorEffect="non-scaling-stroke"
+                          />
+                        ) : (
+                          <polyline
+                            points={draftPoints
+                              .map(
+                                (point) =>
+                                  `${point.x * 1000},${point.y * 1000}`,
+                              )
+                              .join(' ')}
+                            fill="none"
+                            stroke="#facc15"
+                            strokeWidth={4}
+                            vectorEffect="non-scaling-stroke"
+                          />
+                        )}
+
+                        {draftPoints.map((point, index) => (
+                          <circle
+                            key={`${index}-${point.x}-${point.y}`}
+                            cx={point.x * 1000}
+                            cy={point.y * 1000}
+                            r={7}
+                            fill="#facc15"
+                            stroke="#111827"
+                            strokeWidth={2}
+                            vectorEffect="non-scaling-stroke"
+                          />
+                        ))}
+                      </g>
+                    )}
+                  </svg>
+                </div>
+              ) : (
+                <div className="empty-state">
+                  <Camera />
+                  Start the webcam preview or upload a reference image to draw zones.
+                </div>
+              )}
+
+              {previewKind && (
+                <div className="modal-actions">
+                  <Badge tone="muted">
+                    {draftPoints.length} boundary points
+                  </Badge>
+
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() =>
+                      setDraftPoints((previous) => previous.slice(0, -1))
+                    }
+                    disabled={draftPoints.length === 0}
+                  >
+                    Undo Last Point
+                  </Button>
+
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => setDraftPoints([])}
+                    disabled={draftPoints.length === 0}
+                  >
+                    Clear / Redraw
+                  </Button>
+                </div>
+              )}
+
+              {previewKind === 'webcam' && (
+                <p className="form-note">
+                  The browser preview can open your default webcam. If the
+                  configured OpenCV device index refers to a different camera,
+                  use a reference image from that device instead.
+                </p>
+              )}
+            </div>
+          </Panel>
+
+          <Panel
+            title={
+              editingId
+                ? `Edit zone: ${selectedZone?.name ?? ''}`
+                : 'Configure a zone'
+            }
+          >
+            <form
+              className="form-stack"
+              onSubmit={(event) => addZoneToList(event)}
+            >
+              <label>
+                Zone name
+                <input
+                  required
+                  value={form.name}
+                  onChange={(event) =>
+                    setForm({
+                      ...form,
+                      name: event.target.value,
+                    })
+                  }
+                  placeholder="e.g. Main Entrance"
+                />
+              </label>
+
+              <label>
+                Maximum capacity
+                <input
+                  type="number"
+                  min="1"
+                  step="1"
+                  required
+                  value={form.capacity}
+                  onChange={(event) =>
+                    setForm({
+                      ...form,
+                      capacity: event.target.value,
+                    })
+                  }
+                />
+              </label>
+
+              <label>
+                Warning threshold (%)
+                <input
+                  type="number"
+                  min="0"
+                  max="99"
+                  step="1"
+                  required
+                  value={form.warning}
+                  onChange={(event) =>
+                    setForm({
+                      ...form,
+                      warning: event.target.value,
+                    })
+                  }
+                />
+              </label>
+
+              <label>
+                Critical threshold (%)
+                <input
+                  type="number"
+                  min="1"
+                  max="100"
+                  step="1"
+                  required
+                  value={form.critical}
+                  onChange={(event) =>
+                    setForm({
+                      ...form,
+                      critical: event.target.value,
+                    })
+                  }
+                />
+              </label>
+
+              <label className="setting-toggle">
+                <span>
+                  <strong>Zone enabled</strong>
+                  <small>
+                    Disabled zones are not monitored by the AI.
+                  </small>
+                </span>
+
+                <input
+                  type="checkbox"
+                  role="switch"
+                  checked={form.enabled}
+                  onChange={(event) =>
+                    setForm({
+                      ...form,
+                      enabled: event.target.checked,
+                    })
+                  }
+                />
+              </label>
+
+              <div className="modal-actions">
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={beginNewZone}
+                  disabled={savingZones}
+                >
+                  Cancel Editing
+                </Button>
+
+                <Button
+                  type="submit"
+                  disabled={
+                    savingZones ||
+                    draftPoints.length < 3 ||
+                    !cameraId
+                  }
+                >
+                  <Save />
+                  {editingId ? 'Update Zone' : 'Add Zone'}
+                </Button>
+              </div>
+
+              <p className="form-note">
+                Adding or updating a zone changes the pending configuration.
+                Click Save All Zones above to save it to the backend.
+              </p>
+            </form>
+          </Panel>
+
+          <Panel title={`Configured zones (${zones.length})`}>
+            {loadingZones ? (
+              <div className="empty-state">
+                Loading saved zones…
+              </div>
+            ) : zones.length === 0 ? (
+              <div className="empty-state">
+                No zones configured. Draw your first polygon above.
+              </div>
+            ) : (
+              <div className="table-scroll">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Name</th>
+                      <th>Capacity</th>
+                      <th>Warning</th>
+                      <th>Critical</th>
+                      <th>Points</th>
+                      <th>Enabled</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+
+                  <tbody>
+                    {zones.map((zone) => (
+                      <tr key={zone.id}>
+                        <td>{zone.name}</td>
+                        <td>{zone.capacity}</td>
+                        <td>{zone.warning_threshold}%</td>
+                        <td>{zone.critical_threshold}%</td>
+                        <td>{zone.points.length}</td>
+                        <td>
+                          {zone.enabled ? 'Yes' : 'No'}
+                        </td>
+                        <td>
+                          <div className="camera-actions">
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              onClick={() => editZone(zone)}
+                              disabled={savingZones}
+                            >
+                              <Pencil />
+                              Edit
+                            </Button>
+
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => deleteZone(zone)}
+                              disabled={savingZones}
+                            >
+                              <Trash2 />
+                              Delete
+                            </Button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </Panel>
+        </>
+      )}
+    </>
+  );
+}
 export function AlertsPage(){return <><PageHeading title="Alert Management" subtitle="Safety events from the AI alert service." eyebrow="SAFETY RESPONSE"/><Panel title="Safety events"><div className="empty-state"><Shield/>Alerts will appear here when the AI alert service is connected.</div></Panel></>;}
 export function AnalyticsPage(){return <><PageHeading title="Crowd Analytics" subtitle="Historical occupancy and safety intelligence." eyebrow="HISTORICAL INTELLIGENCE"/><div className="analytics-grid"><Panel title="Historical analytics"><div className="empty-state">No historical analytics available yet.</div></Panel></div></>;}
 export function ReportsPage(){return <><PageHeading title="Monitoring Reports" subtitle="Operational reports from the crowd monitoring service." eyebrow="OPERATIONS REPORTING"/><Panel title="Reports"><div className="empty-state"><FileText/>Report generation service not connected yet.</div></Panel><Button variant="outline" disabled><Download/>Generate report</Button></>;}

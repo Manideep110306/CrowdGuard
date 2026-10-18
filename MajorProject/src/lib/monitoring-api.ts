@@ -9,6 +9,24 @@ export type Camera = {
 
 export type CameraDraft = Pick<Camera, 'name' | 'sourceType' | 'source' | 'location'>;
 
+// ============================================================
+// USER-DEFINED MONITORING ZONES
+// ============================================================
+
+export type ZonePoint = {
+  x: number;
+  y: number;
+};
+
+export type CameraZoneConfig = {
+  id: string;
+  name: string;
+  points: ZonePoint[];
+  capacity: number;
+  warning_threshold: number;
+  critical_threshold: number;
+  enabled: boolean;
+};
 export type BackendStatus = {
   total_people: number;
   zones: Record<string, { people: number; capacity: number; occupancy: number; status: string }>;
@@ -217,9 +235,62 @@ export const monitoringApi = {
     { method: 'POST' },
   ),
 
-  monitoring: (cameraId: string) => request<BackendStatus>(
+    monitoring: (cameraId: string) => request<BackendStatus>(
     `/api/monitoring/status/${encodeURIComponent(cameraId)}`,
   ),
+
+  // ==========================================================
+  // GET SAVED ZONES FOR A CAMERA
+  // ==========================================================
+
+  zones: async (
+    cameraId: string,
+  ): Promise<CameraZoneConfig[]> => {
+    const result = await request<{
+      camera_id: string;
+      zones: CameraZoneConfig[];
+      using_default_zones?: boolean;
+    }>(
+      `/api/cameras/${encodeURIComponent(cameraId)}/zones`,
+    );
+
+    if (!Array.isArray(result.zones)) {
+      throw new Error(
+        'Invalid zone configuration received from Flask.',
+      );
+    }
+
+    return result.zones;
+  },
+
+  // ==========================================================
+  // SAVE ZONES FOR A CAMERA
+  // ==========================================================
+
+  saveZones: async (
+    cameraId: string,
+    zones: CameraZoneConfig[],
+  ): Promise<CameraZoneConfig[]> => {
+    const result = await request<{
+      message: string;
+      camera_id: string;
+      zones: CameraZoneConfig[];
+    }>(
+      `/api/cameras/${encodeURIComponent(cameraId)}/zones`,
+      {
+        method: 'PUT',
+        body: JSON.stringify({ zones }),
+      },
+    );
+
+    if (!Array.isArray(result.zones)) {
+      throw new Error(
+        'The server did not return the saved zone configuration.',
+      );
+    }
+
+    return result.zones;
+  },
 };
 
 export const zoneStatus = (zone: Zone) => {

@@ -74,6 +74,8 @@ MONITORING_UPDATE_URL = (
     "http://127.0.0.1:5000/api/monitoring/update"
 )
 
+ALERT_EVENT_URL = "http://127.0.0.1:5000/api/alerts/event"
+
 UPDATE_INTERVAL = 0.5
 
 last_update_time = 0
@@ -270,7 +272,8 @@ def get_status(
 
 def send_monitoring_update(
     zone_counts,
-    zone_statuses
+    zone_statuses,
+    total_detected_people
 ):
 
     if CAMERA_ID is None:
@@ -306,9 +309,7 @@ def send_monitoring_update(
 
     payload = {
         "camera_id": CAMERA_ID,
-        "total_people": sum(
-            zone_counts.values()
-        ),
+        "total_people": total_detected_people,
         "zones": zones_data,
         "updated_at": datetime.now().isoformat()
     }
@@ -324,7 +325,59 @@ def send_monitoring_update(
     except requests.RequestException:
         pass
 
+# ============================================================
+# SEND ALERT EVENTS TO FLASK
+# ============================================================
 
+def send_alert_event(
+    event_type,
+    zone_name,
+    severity=None,
+    people=0,
+    capacity=0,
+    occupancy=0
+):
+    """
+    Send alert-created and alert-resolved events to Flask.
+    Flask stores and updates alerts in MongoDB.
+    """
+
+    if not CAMERA_ID:
+        print("Alert not sent: CAMERA_ID is missing.")
+        return
+
+    payload = {
+        "camera_id": CAMERA_ID,
+        "event_type": event_type,
+        "zone": zone_name,
+        "severity": severity,
+        "people": int(people),
+        "capacity": int(capacity),
+        "occupancy": round(float(occupancy), 1)
+    }
+
+    try:
+        response = requests.post(
+            ALERT_EVENT_URL,
+            json=payload,
+            timeout=2
+        )
+
+        if response.ok:
+            print(
+                f"Alert event sent successfully: "
+                f"{event_type} - {zone_name}"
+            )
+        else:
+            print(
+                f"Alert API returned HTTP {response.status_code}: "
+                f"{response.text}"
+            )
+
+    except requests.RequestException as exc:
+        print(
+            f"Could not send alert event to Flask: {exc}"
+        )
 
 
 # ============================================================
@@ -371,7 +424,7 @@ while True:
         zone["name"]: 0
         for zone in ZONES
     }
-
+    total_detected_people = 0
 
     # ========================================================
     # PROCESS DETECTIONS
@@ -386,7 +439,7 @@ while True:
             # ------------------------------------------------
             # Bounding box
             # ------------------------------------------------
-
+            total_detected_people += 1
             x1, y1, x2, y2 = boxes.xyxy[i].tolist()
 
 
@@ -394,25 +447,23 @@ while True:
             # Calculate person position
             # ------------------------------------------------
 
+            # Calculate the center of the detected person
             center_x = int((x1 + x2) / 2)
             center_y = int((y1 + y2) / 2)
 
-            # Use the bottom-center of the bounding box to determine
-            # which floor region the person occupies.
+# Use the person's center for zone assignment
             person_x = center_x
-            person_y = int(y2)
+            person_y = center_y
 
-
-            # ------------------------------------------------
-            # Find the configured polygon containing this person
-            # ------------------------------------------------
-
+# Determine which configured polygon contains this point
             zone = get_zone(
                 person_x,
                 person_y,
                 frame_width,
                 frame_height
             )
+
+
 
 
             # ------------------------------------------------
@@ -471,13 +522,30 @@ while True:
             # Draw center point
             # ------------------------------------------------
 
+            # Show the exact point used for zone assignment
+            if zone is not None:
+                point_color = (0, 255, 0)  # Green: assigned to a zone
+            else:
+                point_color = (0, 0, 255)  # Red: outside all zones
+
             cv2.circle(
                 frame,
-                (center_x, center_y),
-                5,
-                (0, 0, 255),
+                (person_x, person_y),
+                6,
+                point_color,
                 -1
             )
+
+            if zone is not None:
+                cv2.putText(
+                    frame,
+                    zone,
+                    (person_x + 8, person_y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 0),
+                    2
+                )
 
 
     # ============================================================
@@ -604,6 +672,14 @@ while True:
                     f"{alert_severity} - "
                     f"{occupancy:.1f}%"
                 )
+                send_alert_event(
+                    event_type="created",
+                    zone_name=zone_name,
+                    severity=alert_severity,
+                    people=count,
+                    capacity=capacity,
+                    occupancy=occupancy
+                )
 
                 zone_alert_state[zone_name] = "ACTIVE"
 
@@ -619,6 +695,15 @@ while True:
 
                 print(
                     f"ALERT RESOLVED: {zone_name}"
+                )
+
+    # Tell Flask that the zone has returned to a safe level
+                send_alert_event(
+                    event_type="resolved",
+                    zone_name=zone_name,
+                    people=count,
+                    capacity=capacity,
+                    occupancy=occupancy
                 )
 
                 zone_alert_state[zone_name] = "NORMAL"
@@ -637,7 +722,8 @@ while True:
 
         send_monitoring_update(
             zone_counts,
-            zone_statuses
+            zone_statuses,
+            total_detected_people
         )
 
         last_update_time = current_update_time
@@ -666,13 +752,11 @@ while True:
     # DISPLAY TOTAL PEOPLE
     # ========================================================
 
-    total_people = sum(
-        zone_counts.values()
-    )
+    total_people: total_detected_people
 
     cv2.putText(
         frame,
-        f"Total People: {total_people}",
+        f"Total People: {total_detected_people}",
         (30, y_position),
         cv2.FONT_HERSHEY_SIMPLEX,
         1,

@@ -224,8 +224,15 @@ def get_zone(
     if frame_width <= 0 or frame_height <= 0:
         return None
 
-    normalized_x = center_x / frame_width
-    normalized_y = center_y / frame_height
+    normalized_x = min(
+        max(center_x / max(frame_width - 1, 1), 0.0),
+        1.0
+    )
+
+    normalized_y = min(
+        max(center_y / max(frame_height - 1, 1), 0.0),
+        1.0
+    )
 
     for zone in ZONES:
 

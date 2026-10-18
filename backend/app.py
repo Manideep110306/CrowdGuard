@@ -1,9 +1,9 @@
 import os
-from copy import deepcopy
 from functools import wraps
 import uuid
 import jwt
 from bson import ObjectId
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from flask import Flask, g, jsonify, request
 from flask_cors import CORS
@@ -39,56 +39,29 @@ users_collection = db["users"]
 revoked_tokens_collection = db["revoked_tokens"]
 cameras_collection = db["cameras"]
 monitoring_status_collection = db["monitoring_status"]
+alerts_collection = db["alerts"]
 
 
 # ============================================================
-# DEFAULT MONITORING ZONES
+# FORMAT ALERTS FOR THE FRONTEND
 # ============================================================
 
-DEFAULT_VERTICAL_ZONES = [
-    {
-        "id": "default-left-zone",
-        "name": "Left Zone",
-        "points": [
-            {"x": 0.0, "y": 0.0},
-            {"x": 0.3333, "y": 0.0},
-            {"x": 0.3333, "y": 1.0},
-            {"x": 0.0, "y": 1.0},
-        ],
-        "capacity": 20,
-        "warning_threshold": 80,
-        "critical_threshold": 100,
-        "enabled": True,
-    },
-    {
-        "id": "default-center-zone",
-        "name": "Center Zone",
-        "points": [
-            {"x": 0.3333, "y": 0.0},
-            {"x": 0.6667, "y": 0.0},
-            {"x": 0.6667, "y": 1.0},
-            {"x": 0.3333, "y": 1.0},
-        ],
-        "capacity": 20,
-        "warning_threshold": 80,
-        "critical_threshold": 100,
-        "enabled": True,
-    },
-    {
-        "id": "default-right-zone",
-        "name": "Right Zone",
-        "points": [
-            {"x": 0.6667, "y": 0.0},
-            {"x": 1.0, "y": 0.0},
-            {"x": 1.0, "y": 1.0},
-            {"x": 0.6667, "y": 1.0},
-        ],
-        "capacity": 20,
-        "warning_threshold": 80,
-        "critical_threshold": 100,
-        "enabled": True,
-    },
-]
+def alert_to_response(alert):
+    return {
+        "id": str(alert["_id"]),
+        "camera_id": alert.get("camera_id", ""),
+        "camera_name": alert.get("camera_name", "Unknown camera"),
+        "severity": alert.get("severity", "Warning"),
+        "zone": alert.get("zone", ""),
+        "people": alert.get("people", 0),
+        "capacity": alert.get("capacity", 0),
+        "occupancy": alert.get("occupancy", 0),
+        "time": alert.get("created_at", ""),
+        "status": alert.get("status", "Active"),
+        "history": alert.get("history", []),
+    }
+
+
 
 
 # ============================================================
@@ -195,17 +168,7 @@ def get_owned_camera(camera_id):
     )
 
 
-def default_vertical_zones():
-    """Return a fresh copy of the built-in vertical monitoring zones."""
-    return deepcopy(DEFAULT_VERTICAL_ZONES)
 
-
-def camera_zones_or_default(camera):
-    """Use saved camera zones, or fall back to the built-in vertical zones."""
-    zones = camera.get("zones")
-    if isinstance(zones, list) and zones:
-        return zones
-    return default_vertical_zones()
 
 # ============================================================
 # GET USER-DEFINED ZONES FOR A CAMERA
@@ -225,12 +188,15 @@ def get_camera_zones(camera_id):
             "error": "Camera not found."
         }), 404
 
-    zones = camera_zones_or_default(camera)
+    zones = camera.get("zones", [])
+
+    if not isinstance(zones, list):
+        zones = []
 
     return jsonify({
         "camera_id": camera_id,
         "zones": zones,
-        "using_default_zones": not bool(camera.get("zones")),
+        "using_default_zones": False,
     }), 200
 
 
@@ -482,7 +448,7 @@ def add_camera():
         "source": source,
         "location": location.strip() if isinstance(location, str) else location,
         "status": "inactive",
-        "zones": default_vertical_zones(),
+        "zones": [],
     }
 
     result = cameras_collection.insert_one(camera)
@@ -602,7 +568,10 @@ def start_camera_monitoring(camera_id):
     # 2. Get the saved zones for this camera
     # --------------------------------------------------------
 
-    zones = camera_zones_or_default(camera)
+    zones = camera.get("zones", [])
+
+    if not isinstance(zones, list):
+        zones = []
 
     # Keep only enabled zones
     enabled_zones = [
@@ -742,6 +711,193 @@ def get_monitoring_status(camera_id):
         return jsonify({"error": "No monitoring data available."}), 404
 
     return jsonify(status), 200
+
+# ============================================================
+# RECEIVE ALERT EVENTS FROM THE AI ENGINE
+# ============================================================
+
+@app.route("/api/alerts/event", methods=["POST"])
+def receive_alert_event():
+    data = request.get_json(silent=True)
+
+    if not isinstance(data, dict):
+        return jsonify({"error": "A JSON request body is required."}), 400
+
+    camera_id = str(data.get("camera_id", ""))
+    event_type = data.get("event_type")
+    zone_name = data.get("zone")
+
+    if not ObjectId.is_valid(camera_id):
+        return jsonify({"error": "Invalid camera ID."}), 400
+
+    camera = cameras_collection.find_one({
+        "_id": ObjectId(camera_id)
+    })
+
+    if camera is None:
+        return jsonify({"error": "Camera not found."}), 404
+
+    if not isinstance(zone_name, str) or not zone_name.strip():
+        return jsonify({"error": "Zone name is required."}), 400
+
+    zone_name = zone_name.strip()
+    now = datetime.now(timezone.utc).isoformat()
+
+    # --------------------------------------------------------
+    # CREATE AN ALERT
+    # --------------------------------------------------------
+
+    if event_type == "created":
+        severity = str(data.get("severity", "")).upper()
+
+        if severity not in ("WARNING", "CRITICAL"):
+            return jsonify({"error": "Invalid alert severity."}), 400
+
+        try:
+            people = int(data.get("people", 0))
+            capacity = int(data.get("capacity", 0))
+            occupancy = float(data.get("occupancy", 0))
+        except (TypeError, ValueError):
+            return jsonify({"error": "Invalid alert statistics."}), 400
+
+        if people < 0 or capacity <= 0 or occupancy < 0:
+            return jsonify({"error": "Alert statistics are out of range."}), 400
+
+        alert = {
+            "user_id": camera.get("user_id"),
+            "camera_id": camera_id,
+            "camera_name": camera.get("name", "Unknown camera"),
+            "zone": zone_name,
+            "severity": severity.title(),
+            "people": people,
+            "capacity": capacity,
+            "occupancy": round(occupancy, 1),
+            "status": "Active",
+            "created_at": now,
+            "updated_at": now,
+            "history": [
+                f"{now}: {severity.title()} alert created."
+            ],
+        }
+
+        result = alerts_collection.insert_one(alert)
+        alert["_id"] = result.inserted_id
+
+        return jsonify({
+            "message": "Alert created successfully.",
+            "alert": alert_to_response(alert),
+        }), 201
+
+    # --------------------------------------------------------
+    # RESOLVE THE ACTIVE ALERT FOR A ZONE
+    # --------------------------------------------------------
+
+    if event_type == "resolved":
+        alert = alerts_collection.find_one(
+            {
+                "camera_id": camera_id,
+                "zone": zone_name,
+                "status": {"$in": ["Active", "Acknowledged"]},
+            },
+            sort=[("_id", -1)],
+        )
+
+        if alert is None:
+            return jsonify({
+                "message": "No active alert exists for this zone."
+            }), 200
+
+        alerts_collection.update_one(
+            {"_id": alert["_id"]},
+            {
+                "$set": {
+                    "status": "Resolved",
+                    "updated_at": now,
+                    "resolved_at": now,
+                },
+                "$push": {
+                    "history": f"{now}: Alert resolved."
+                },
+            },
+        )
+
+        return jsonify({
+            "message": "Alert resolved successfully.",
+            "alert_id": str(alert["_id"]),
+        }), 200
+
+    return jsonify({
+        "error": "event_type must be 'created' or 'resolved'."
+    }), 400
+
+
+# ============================================================
+# GET ALERTS FOR THE LOGGED-IN USER
+# ============================================================
+
+@app.route("/api/alerts", methods=["GET"])
+@require_auth
+def get_alerts():
+    alerts = alerts_collection.find(
+        {"user_id": g.current_user_id}
+    ).sort("_id", -1).limit(200)
+
+    return jsonify([
+        alert_to_response(alert)
+        for alert in alerts
+    ]), 200
+
+
+# ============================================================
+# ACKNOWLEDGE AN ALERT
+# ============================================================
+
+@app.route(
+    "/api/alerts/<alert_id>/acknowledge",
+    methods=["POST"]
+)
+@require_auth
+def acknowledge_alert(alert_id):
+
+    if not ObjectId.is_valid(alert_id):
+        return jsonify({"error": "Invalid alert ID."}), 400
+
+    alert = alerts_collection.find_one({
+        "_id": ObjectId(alert_id),
+        "user_id": g.current_user_id,
+    })
+
+    if alert is None:
+        return jsonify({"error": "Alert not found."}), 404
+
+    if alert.get("status") != "Active":
+        return jsonify({
+            "error": "Only active alerts can be acknowledged."
+        }), 409
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    alerts_collection.update_one(
+        {"_id": alert["_id"], "user_id": g.current_user_id},
+        {
+            "$set": {
+                "status": "Acknowledged",
+                "updated_at": now,
+            },
+            "$push": {
+                "history": f"{now}: Alert acknowledged by operator."
+            },
+        },
+    )
+
+    updated_alert = alerts_collection.find_one({
+        "_id": alert["_id"]
+    })
+
+    return jsonify({
+        "message": "Alert acknowledged successfully.",
+        "alert": alert_to_response(updated_alert),
+    }), 200
 
 
 # ============================================================
